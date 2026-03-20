@@ -27,3 +27,8 @@ def log_responses(name: str, role: str, questions: list, answers: list):
     
     for question, answer in zip(questions, answers):
         sheet.append_row([date_today, name, role, question, answer])
+def log_late_response(name: str, role: str, question: str, answer: str):
+    sheet = get_sheet()
+    ensure_headers(sheet)
+    date_today = datetime.now().strftime("%Y-%m-%d %H:%M")
+    sheet.append_row([date_today, name, role, question, answer, "LATE"])

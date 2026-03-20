@@ -1,3 +1,4 @@
+import asyncio
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
@@ -9,8 +10,9 @@ from telegram.ext import (
 )
 from questions import ROLE_QUESTIONS
 from sentiment import analyze_sentiment
-from sheets import log_responses
-from config import TELEGRAM_BOT_TOKEN
+from sheets import log_responses, log_late_response
+from escalation import escalation_watch, notify_manager_staff_responded, manager_acknowledged
+from config import TELEGRAM_BOT_TOKEN, MANAGER_TELEGRAM_ID
 
 # States
 ASK_NAME, ASK_ROLE, ASK_QUESTIONS = range(3)
@@ -59,6 +61,8 @@ async def get_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["questions"] = role_data["questions"]
     context.user_data["answers"] = []
     context.user_data["current_index"] = 0
+    context.user_data["answered"] = False
+    context.user_data["escalated"] = False
 
     await update.message.reply_text(
         f"Got it! You are logged in as *{role_data['role_name']}* ✅\n\nLet's start your daily check-in!",
@@ -66,21 +70,55 @@ async def get_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-    # Ask first question
+    # Ask first question and start escalation watch
     first_question = role_data["questions"][0]
-    await update.message.reply_text(f"Q1: {first_question}")
+    await ask_question(update, context, first_question)
     return ASK_QUESTIONS
 
-# ── Questions loop ───────────────────────────────────────
+# ── Ask question + start escalation timer ────────────────
+async def ask_question(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str):
+    index = context.user_data["current_index"]
+    name = context.user_data["name"]
+    role = context.user_data["role"]
+
+    # Reset flags for each new question
+    context.user_data["answered"] = False
+    context.user_data["escalated"] = False
+
+    await update.message.reply_text(f"Q{index + 1}: {question}")
+
+    # Start escalation watcher as background task
+    asyncio.create_task(
+        escalation_watch(
+            context=context,
+            chat_id=update.effective_chat.id,
+            staff_name=name,
+            role=role,
+            question=question
+        )
+    )
+
+# ── Handle answer ────────────────────────────────────────
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = update.message.text.strip()
     index = context.user_data["current_index"]
     questions = context.user_data["questions"]
     current_question = questions[index]
+    name = context.user_data["name"]
+    role = context.user_data["role"]
+    was_escalated = context.user_data.get("escalated", False)
+
+    # Mark as answered to stop escalation
+    context.user_data["answered"] = True
 
     # Sentiment analysis
     answer = analyze_sentiment(current_question, reply)
     context.user_data["answers"].append(answer)
+
+    # If late response notify manager
+    if was_escalated:
+        await notify_manager_staff_responded(name, role, current_question, answer)
+        log_late_response(name, role, current_question, answer)
 
     index += 1
     context.user_data["current_index"] = index
@@ -88,12 +126,10 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # More questions remaining
     if index < len(questions):
         next_question = questions[index]
-        await update.message.reply_text(f"Q{index + 1}: {next_question}")
+        await ask_question(update, context, next_question)
         return ASK_QUESTIONS
 
     # All questions done
-    name = context.user_data["name"]
-    role = context.user_data["role"]
     answers = context.user_data["answers"]
 
     # Log to Google Sheets
@@ -108,6 +144,19 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(summary, parse_mode="Markdown")
     return ConversationHandler.END
+
+# ── Manager acknowledgement handler ─────────────────────
+async def manager_ack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+
+    if user_id == MANAGER_TELEGRAM_ID:
+        for key in list(manager_acknowledged.keys()):
+            if not manager_acknowledged[key]:
+                manager_acknowledged[key] = True
+                await update.message.reply_text(
+                    "✅ Acknowledged! Second level escalation has been stopped."
+                )
+                return
 
 # ── Cancel ───────────────────────────────────────────────
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -132,8 +181,16 @@ def main():
     )
 
     app.add_handler(conv_handler)
+
+    # Manager acknowledgement handler — group 1 so it runs alongside conversation
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.User(int(MANAGER_TELEGRAM_ID)),
+        manager_ack
+    ), group=1)
+
     print("🌿 Haydays bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
+    
